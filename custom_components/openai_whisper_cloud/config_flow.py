@@ -112,6 +112,12 @@ async def _lookup_model(
     if response.status == 404:
         raise WhisperModelNotFound
     if response.status != 200:
+        _LOGGER.warning(
+            "Model lookup on %s returned unexpected status %d - %s",
+            url,
+            response.status,
+            response.reason or "",
+        )
         raise CannotConnect
 
 
@@ -119,21 +125,14 @@ async def validate_builtin_provider(
     hass: HomeAssistant, provider: WhisperProvider, model_name: str, api_key: str
 ) -> None:
     """Verify the API key and the selected model exist on a builtin provider."""
-    if provider.supports_model_lookup:
-        await _lookup_model(hass, provider, model_name, api_key)
+    if not provider.supports_model_lookup:
+        # Providers without a per-model lookup endpoint cannot be probed: MiMo
+        # for instance answers ``/v1/models/{model}`` with 400 even for a valid
+        # key, while ``/v1/models`` returns 401 for a bad key and 200 otherwise.
+        await validate_custom_provider(hass, provider.base_url, api_key)
         return
 
-    # Providers without a documented per-model lookup endpoint: probe it anyway
-    # so a bad API key is still reported, and fall back to a lenient check of
-    # the models list when the endpoint simply does not exist.
-    try:
-        await _lookup_model(hass, provider, model_name, api_key)
-    except WhisperModelNotFound:
-        _LOGGER.debug(
-            "%s does not expose a per-model lookup endpoint, checking the models list instead",
-            provider.name,
-        )
-        await validate_custom_provider(hass, provider.base_url, api_key)
+    await _lookup_model(hass, provider, model_name, api_key)
 
 
 async def validate_custom_provider(
