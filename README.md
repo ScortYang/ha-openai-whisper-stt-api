@@ -7,6 +7,8 @@ This HA custom integration lets you use any compatible OpenAI API (OpenAI, GroqC
 - *OpenAI*
 - *GroqCloud*
 - *Mistral AI*
+- *Cohere*
+- *Xiaomi MiMo*
 - *Custom*
 
 ## OpenAI
@@ -47,6 +49,35 @@ Currently all GroqCloud Whisper models are free up to 28800 audio seconds per da
 Currently all Mistral AI models are free up to 1 billion token per month !
 
 - `voxtral-mini`
+
+## Xiaomi MiMo
+
+### Requirements 📖
+
+- A Xiaomi MiMo account 👤  --> You can create one [here](https://platform.xiaomimimo.com/)
+- An `API Key` 🔑 --> You can generate one [here](https://platform.xiaomimimo.com/console/api-keys)
+
+### Models
+
+- `mimo-v2.5-asr` - Chinese/English speech recognition with automatic language
+  detection, also covers Chinese dialects (Cantonese, Wu, Minnan, Sichuanese, …).
+
+### Notes 📝
+
+- MiMo ASR is not a classic `/v1/audio/transcriptions` endpoint: it is served
+  through the OpenAI compatible chat completions API
+  (`https://api.xiaomimimo.com/v1/chat/completions`) and receives the audio as a
+  Base64 encoded `input_audio` part. This is handled transparently by the
+  integration, no extra configuration is needed.
+- Only `wav` and `mp3` audio is accepted and the Base64 payload is limited to
+  10 MB, so MiMo utterances are kept below ~7 MB of raw audio (roughly three
+  minutes of 16 kHz mono PCM). Longer recordings are rejected with a clear log
+  message instead of being silently truncated.
+- `language` only accepts `zh`, `en` or `auto`. Home Assistant requests for any
+  other language fall back to automatic detection, and no language is sent when
+  none is requested.
+- `temperature` and `prompt` are not supported by this provider, so the setup
+  and options dialogs do not show them.
 
 ## Custom
 

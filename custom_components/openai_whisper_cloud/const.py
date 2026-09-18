@@ -25,6 +25,10 @@ REQUEST_TIMEOUT: Final = 30
 TRANSCRIPTION_TIMEOUT: Final = 60
 MAX_AUDIO_SIZE_BYTES: Final = int(24.5 * 1024 * 1024)
 
+# MiMo ASR caps the base64 encoded audio at 10 MB; base64 expands the payload
+# by ~4/3, so the raw audio must stay well below that.
+MIMO_MAX_AUDIO_SIZE_BYTES: Final = 7_000_000
+
 # Config entry version this release migrates to
 CONFIG_VERSION: Final = 2
 CONFIG_MINOR_VERSION: Final = 1

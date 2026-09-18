@@ -79,10 +79,15 @@ class WhisperModelNotFound(exceptions.HomeAssistantError):
     """Error to indicate the selected model does not exist."""
 
 
-async def validate_builtin_provider(
+async def _lookup_model(
     hass: HomeAssistant, provider: WhisperProvider, model_name: str, api_key: str
 ) -> None:
-    """Verify the API key and the selected model exist on a builtin provider."""
+    """Check an API key and a model against ``GET /v1/models/{model}``.
+
+    Raises :class:`InvalidAPIKey` on 401, :class:`UnauthorizedError` on 403,
+    :class:`WhisperModelNotFound` on 404 and :class:`CannotConnect` when the
+    provider is unreachable or answers with an unexpected status.
+    """
     session = async_get_clientsession(hass)
     url = f"{provider.base_url.rstrip('/')}/v1/models/{model_name}"
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -108,6 +113,27 @@ async def validate_builtin_provider(
         raise WhisperModelNotFound
     if response.status != 200:
         raise CannotConnect
+
+
+async def validate_builtin_provider(
+    hass: HomeAssistant, provider: WhisperProvider, model_name: str, api_key: str
+) -> None:
+    """Verify the API key and the selected model exist on a builtin provider."""
+    if provider.supports_model_lookup:
+        await _lookup_model(hass, provider, model_name, api_key)
+        return
+
+    # Providers without a documented per-model lookup endpoint: probe it anyway
+    # so a bad API key is still reported, and fall back to a lenient check of
+    # the models list when the endpoint simply does not exist.
+    try:
+        await _lookup_model(hass, provider, model_name, api_key)
+    except WhisperModelNotFound:
+        _LOGGER.debug(
+            "%s does not expose a per-model lookup endpoint, checking the models list instead",
+            provider.name,
+        )
+        await validate_custom_provider(hass, provider.base_url, api_key)
 
 
 async def validate_custom_provider(
@@ -156,18 +182,21 @@ async def validate_custom_provider(
 
 def _builtin_schema(provider: WhisperProvider, api_key_optional: bool) -> vol.Schema:
     """Build the form schema for a builtin provider."""
-    return vol.Schema(
-        {
-            vol.Required(CONF_NAME, default=f"{provider.name} Whisper"): cv.string,
-            vol.Required(CONF_API_KEY) if not api_key_optional else vol.Optional(CONF_API_KEY): cv.string,
-            vol.Required(
-                CONF_MODEL,
-                default=provider.default_model,
-            ): vol.In([model.name for model in provider.models]),
-            vol.Optional(CONF_TEMPERATURE, default=DEFAULT_TEMPERATURE): TEMPERATURE_SCHEMA,
-            vol.Optional(CONF_PROMPT, default=DEFAULT_PROMPT): cv.string,
-        }
-    )
+    schema: dict[Any, Any] = {
+        vol.Required(CONF_NAME, default=f"{provider.name} Whisper"): cv.string,
+        vol.Required(CONF_API_KEY) if not api_key_optional else vol.Optional(CONF_API_KEY): cv.string,
+        vol.Required(
+            CONF_MODEL,
+            default=provider.default_model,
+        ): vol.In([model.name for model in provider.models]),
+    }
+    if provider.supports_temperature:
+        schema[vol.Optional(CONF_TEMPERATURE, default=DEFAULT_TEMPERATURE)] = (
+            TEMPERATURE_SCHEMA
+        )
+    if provider.supports_prompt:
+        schema[vol.Optional(CONF_PROMPT, default=DEFAULT_PROMPT)] = cv.string
+    return vol.Schema(schema)
 
 
 CUSTOM_SCHEMA = vol.Schema(
@@ -209,20 +238,22 @@ class OptionsFlowHandler(OptionsFlowWithConfigEntry):
             schema[vol.Required(CONF_MODEL, default=current_model)] = vol.In(
                 model_names
             )
-        schema[
-            vol.Required(
-                CONF_TEMPERATURE,
-                default=self.config_entry.options.get(
-                    CONF_TEMPERATURE, DEFAULT_TEMPERATURE
-                ),
-            )
-        ] = TEMPERATURE_SCHEMA
-        schema[
-            vol.Optional(
-                CONF_PROMPT,
-                default=self.config_entry.options.get(CONF_PROMPT, DEFAULT_PROMPT),
-            )
-        ] = cv.string
+        if provider.supports_temperature:
+            schema[
+                vol.Required(
+                    CONF_TEMPERATURE,
+                    default=self.config_entry.options.get(
+                        CONF_TEMPERATURE, DEFAULT_TEMPERATURE
+                    ),
+                )
+            ] = TEMPERATURE_SCHEMA
+        if provider.supports_prompt:
+            schema[
+                vol.Optional(
+                    CONF_PROMPT,
+                    default=self.config_entry.options.get(CONF_PROMPT, DEFAULT_PROMPT),
+                )
+            ] = cv.string
 
         return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
 
@@ -294,7 +325,9 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                     options={
                         CONF_MODEL: user_input[CONF_MODEL],
-                        CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
+                        CONF_TEMPERATURE: user_input.get(
+                            CONF_TEMPERATURE, DEFAULT_TEMPERATURE
+                        ),
                         CONF_PROMPT: user_input.get(CONF_PROMPT, DEFAULT_PROMPT),
                     },
                 )
@@ -397,7 +430,9 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                     data=new_data,
                     options={
                         CONF_MODEL: user_input[CONF_MODEL],
-                        CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
+                        CONF_TEMPERATURE: user_input.get(
+                            CONF_TEMPERATURE, DEFAULT_TEMPERATURE
+                        ),
                         CONF_PROMPT: user_input.get(CONF_PROMPT, DEFAULT_PROMPT),
                     },
                 )

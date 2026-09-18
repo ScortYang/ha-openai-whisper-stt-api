@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Final
+from typing import Final, Literal
 from urllib.parse import urlparse
 
-from .const import SUPPORTED_LANGUAGES
+from .const import MAX_AUDIO_SIZE_BYTES, MIMO_MAX_AUDIO_SIZE_BYTES, SUPPORTED_LANGUAGES
+
+# How the audio is sent to the provider:
+#   - "transcription": multipart upload to an /audio/transcriptions endpoint
+#   - "chat_completions": OpenAI chat completions call carrying a base64
+#     ``input_audio`` content part (Xiaomi MiMo ASR)
+ApiStyle = Literal["transcription", "chat_completions"]
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,15 @@ class WhisperProvider:
     supports_response_format: bool = True
     multipart_file_field: str = "file"
     custom: bool = False
+    api_style: ApiStyle = "transcription"
+    # Language codes accepted by the API. Empty means "anything the model
+    # advertises". Requests for other languages are replaced by
+    # ``language_fallback`` when set, otherwise they are sent unchanged.
+    api_languages: tuple[str, ...] = ()
+    language_fallback: str | None = None
+    # Providers without a per-model lookup endpoint are validated leniently.
+    supports_model_lookup: bool = True
+    max_audio_size_bytes: int = MAX_AUDIO_SIZE_BYTES
 
     @property
     def transcription_url(self) -> str:
@@ -139,6 +154,29 @@ PROVIDERS: Final[dict[str, WhisperProvider]] = {
             supports_temperature=False,
             supports_prompt=False,
             supports_response_format=False,
+        ),
+        WhisperProvider(
+            key="mimo",
+            name="Xiaomi MiMo",
+            base_url="https://api.xiaomimimo.com",
+            models=(
+                # Only Chinese and English are supported, everything else is
+                # handled by the API's automatic language detection.
+                WhisperModel("mimo-v2.5-asr", languages=["zh", "en"]),
+            ),
+            default_model="mimo-v2.5-asr",
+            # MiMo ASR is exposed as an OpenAI compatible chat completions
+            # endpoint that takes a base64 encoded audio part.
+            transcription_path="/v1/chat/completions",
+            supports_temperature=False,
+            supports_prompt=False,
+            supports_response_format=False,
+            api_style="chat_completions",
+            api_languages=("zh", "en"),
+            language_fallback="auto",
+            # No per-model lookup endpoint: validation uses the models list.
+            supports_model_lookup=False,
+            max_audio_size_bytes=MIMO_MAX_AUDIO_SIZE_BYTES,
         ),
         WhisperProvider(key="custom", name="Custom", custom=True),
     )

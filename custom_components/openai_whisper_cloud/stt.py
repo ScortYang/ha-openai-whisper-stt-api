@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import logging
 from collections.abc import AsyncIterable
+from typing import Any
 import wave
 
 import aiohttp
@@ -38,7 +40,6 @@ from .const import (
     DEFAULT_PROMPT,
     DEFAULT_TEMPERATURE,
     DOMAIN,
-    MAX_AUDIO_SIZE_BYTES,
     TRANSCRIPTION_TIMEOUT,
 )
 from .whisper_provider import WhisperModel, WhisperProvider, custom_provider, get_provider
@@ -91,6 +92,55 @@ def resolve_language(language: str | None, supported: list[str]) -> str | None:
     if base in supported:
         return base
     return lang
+
+
+def resolve_api_language(
+    language: str | None, provider: WhisperProvider
+) -> str | None:
+    """Map a language onto one accepted by the provider's API.
+
+    Some APIs (e.g. MiMo ASR) only accept a small set of language codes. Any
+    other request is replaced by the provider's fallback, usually ``auto`` for
+    automatic language detection.
+    """
+    if not language:
+        return None
+    if provider.api_languages and language not in provider.api_languages:
+        return provider.language_fallback
+    return language
+
+
+def extract_transcription(result: dict[str, Any] | str) -> str:
+    """Extract the transcript from a provider response.
+
+    Handles OpenAI style transcription payloads (``{"text": ...}``), the chat
+    completions payload used by MiMo ASR (``choices[0].message.content``) and
+    plain text bodies.
+    """
+    if not isinstance(result, dict):
+        return str(result).strip()
+
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                parts = [
+                    part["text"]
+                    for part in content
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ]
+                joined = "".join(parts).strip()
+                if joined:
+                    return joined
+
+    text = result.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    return ""
 
 
 def encode_wav(data: bytes, channels: int, sample_rate: int) -> bytes:
@@ -226,6 +276,36 @@ class OpenAIWhisperEntity(SpeechToTextEntity):
             form.add_field("response_format", "json")
         return form
 
+    def _build_chat_payload(
+        self, wav_data: bytes, language: str | None
+    ) -> dict[str, Any]:
+        """Build the JSON body of a chat completions speech-to-text request.
+
+        Used by providers such as MiMo ASR that accept the audio as a base64
+        encoded ``input_audio`` content part instead of a multipart upload.
+        """
+        audio = base64.b64encode(wav_data).decode("ascii")
+        payload: dict[str, Any] = {
+            "model": self.model.name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": f"data:audio/wav;base64,{audio}",
+                                "format": "wav",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        if language:
+            payload["asr_options"] = {"language": language}
+        return payload
+
     async def async_process_audio_stream(
         self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> SpeechResult:
@@ -234,13 +314,15 @@ class OpenAIWhisperEntity(SpeechToTextEntity):
 
         chunks: list[bytes] = []
         size = 0
+        max_size = self.provider.max_audio_size_bytes
         async for chunk in stream:
             chunks.append(chunk)
             size += len(chunk)
-            if size > MAX_AUDIO_SIZE_BYTES:
+            if size > max_size:
                 _LOGGER.error(
-                    "Audio stream exceeds the maximum allowed size of %.1f MB",
-                    MAX_AUDIO_SIZE_BYTES / (1024 * 1024),
+                    "Audio stream exceeds the maximum allowed size of %.1f MB for %s",
+                    max_size / (1024 * 1024),
+                    self.provider.name,
                 )
                 return SpeechResult("", SpeechResultState.ERROR)
 
@@ -255,35 +337,49 @@ class OpenAIWhisperEntity(SpeechToTextEntity):
             "Encoded %.2f MB of audio to WAV", len(wav_data) / (1024 * 1024)
         )
 
-        language = resolve_language(metadata.language, self.model.languages)
+        language = resolve_api_language(
+            resolve_language(metadata.language, self.model.languages),
+            self.provider,
+        )
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         session = async_get_clientsession(self.hass)
 
-        file_field = self.provider.multipart_file_field
         try:
-            response = await session.post(
-                self.provider.transcription_url,
-                data=self._build_form(wav_data, language, file_field),
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
-            )
-            if response.status == 422:
-                body = await response.text()
-                missing = missing_multipart_field(body)
-                if missing and missing != file_field:
-                    _LOGGER.info(
-                        "Provider expects the audio in multipart field '%s' instead of '%s', retrying",
-                        missing,
-                        file_field,
-                    )
-                    file_field = missing
-                    response = await session.post(
-                        self.provider.transcription_url,
-                        data=self._build_form(wav_data, language, file_field),
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
-                    )
+            if self.provider.api_style == "chat_completions":
+                payload = await self.hass.async_add_executor_job(
+                    self._build_chat_payload, wav_data, language
+                )
+                response = await session.post(
+                    self.provider.transcription_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
+                )
+            else:
+                file_field = self.provider.multipart_file_field
+                response = await session.post(
+                    self.provider.transcription_url,
+                    data=self._build_form(wav_data, language, file_field),
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
+                )
+                if response.status == 422:
+                    body = await response.text()
+                    missing = missing_multipart_field(body)
+                    if missing and missing != file_field:
+                        _LOGGER.info(
+                            "Provider expects the audio in multipart field '%s' instead of '%s', retrying",
+                            missing,
+                            file_field,
+                        )
+                        file_field = missing
+                        response = await session.post(
+                            self.provider.transcription_url,
+                            data=self._build_form(wav_data, language, file_field),
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=TRANSCRIPTION_TIMEOUT),
+                        )
 
             if response.status != 200:
                 body = await response.text()
@@ -300,10 +396,7 @@ class OpenAIWhisperEntity(SpeechToTextEntity):
             except ValueError:
                 # Plain text response (e.g. whisper-asr-webservice /asr)
                 result = body_text
-            if isinstance(result, dict):
-                transcription = result.get("text", "")
-            else:
-                transcription = str(result).strip()
+            transcription = extract_transcription(result)
         except (TimeoutError, asyncio.TimeoutError, aiohttp.ClientError, ValueError) as err:
             _LOGGER.error("Error during transcription: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
